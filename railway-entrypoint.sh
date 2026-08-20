@@ -48,7 +48,7 @@ unset SA_PASSWORD
 #   Error: The system directory [/.system] could not be created ... Permission denied
 mkdir -p "$DATA_ROOT/data" "$DATA_ROOT/log" "$DATA_ROOT/backup" "$DATA_ROOT/secrets"
 owner_before="$(stat -c '%u:%g' "$DATA_ROOT")"
-if [ "${MSSQL_RUN_AS_ROOT:-false}" = "true" ]; then
+if [ "${MSSQL_RUN_AS_ROOT:-true}" = "true" ]; then
   chown -R 0:0 "$DATA_ROOT"
 else
   chown -R "${MSSQL_UID}:${MSSQL_GID}" "$DATA_ROOT"
@@ -120,8 +120,8 @@ if [ "${MSSQL_TUNE_PARALLELISM:-true}" = "true" ]; then
   /usr/local/bin/tune.sh &
 fi
 
-if [ "${MSSQL_RUN_AS_ROOT:-false}" = "true" ]; then
-  log "starting SQL Server as root (MSSQL_RUN_AS_ROOT=true)"
+if [ "${MSSQL_RUN_AS_ROOT:-true}" = "true" ]; then
+  log "starting SQL Server as root"
   exec $AFFINITY /opt/mssql/bin/launch_sqlservr.sh "$@"
 fi
 
