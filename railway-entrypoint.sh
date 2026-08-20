@@ -52,7 +52,61 @@ chown -R "${MSSQL_UID}:${MSSQL_GID}" "$DATA_ROOT"
 chmod 0770 "$DATA_ROOT"
 log "volume ${DATA_ROOT} owner ${owner_before} -> $(stat -c '%u:%g' "$DATA_ROOT")"
 
-# --- 3. Parallelism sized from the cgroup ------------------------------------
+# --- 3. Memory and CPU ceilings ---------------------------------------------
+# SQL Server sizes itself from what the kernel reports, and on Railway that is
+# the HOST: a container with a 8 GB limit logged "Processors: 48, Total Memory:
+# 412550619136 bytes" and then died during startup of master with
+# "Reason: 0x00000006 Message: Stack Overflow" before it ever listened. Docker's
+# own cgroup reporting hides this locally (there the engine reads the limit
+# correctly), so it only appears on the platform. Read the cgroup ourselves and
+# hand the engine a memory ceiling and a CPU affinity mask it can actually honour.
+cgroup_mem_bytes() {
+  if [ -r /sys/fs/cgroup/memory.max ]; then
+    v="$(cat /sys/fs/cgroup/memory.max)"
+  elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+    v="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"
+  else
+    v="max"
+  fi
+  case "$v" in ''|max|0) echo 0 ;; *) echo "$v" ;; esac
+}
+cgroup_cpus() {
+  if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r q p_ < /sys/fs/cgroup/cpu.max || true
+    if [ "${q:-max}" != "max" ] && [ "${p_:-0}" -gt 0 ]; then
+      echo $(( (q + p_ - 1) / p_ )); return
+    fi
+  elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
+    q="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+    p_="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+    if [ "$q" -gt 0 ] && [ "$p_" -gt 0 ]; then echo $(( (q + p_ - 1) / p_ )); return; fi
+  fi
+  echo 0
+}
+
+host_mem_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo)"
+mem_bytes="$(cgroup_mem_bytes)"
+cpu_quota="$(cgroup_cpus)"
+online_cpus="$(nproc --all 2>/dev/null || echo 1)"
+log "cgroup memory.max=${mem_bytes} host MemTotal=$((host_mem_kb / 1024))MB cpu quota=${cpu_quota} online=${online_cpus}"
+
+if [ -z "${MSSQL_MEMORY_LIMIT_MB:-}" ] && [ "$mem_bytes" -gt 0 ]; then
+  mem_mb=$((mem_bytes / 1024 / 1024))
+  # SQL Server's own guidance is to leave headroom for the OS and for the
+  # non-buffer-pool allocations it makes outside this ceiling.
+  limit_mb=$((mem_mb * 70 / 100))
+  [ "$limit_mb" -lt 2048 ] && limit_mb=2048
+  export MSSQL_MEMORY_LIMIT_MB="$limit_mb"
+  log "MSSQL_MEMORY_LIMIT_MB=${limit_mb} (container limit ${mem_mb}MB)"
+fi
+
+AFFINITY=""
+if [ "$cpu_quota" -gt 0 ] && [ "$online_cpus" -gt "$cpu_quota" ] && command -v taskset >/dev/null 2>&1; then
+  AFFINITY="taskset -c 0-$((cpu_quota - 1))"
+  log "pinning to CPUs 0-$((cpu_quota - 1)) (${online_cpus} online, quota ${cpu_quota})"
+fi
+
+# --- 4. Parallelism sized from the cgroup ------------------------------------
 # SQL Server 2022 already reads the cgroup memory limit, but it counts logical
 # processors from the HOST (measured: "5 logical processors" inside a 2-CPU
 # container), so MAXDOP is left at a value the container cannot deliver. Applied
@@ -62,5 +116,5 @@ if [ "${MSSQL_TUNE_PARALLELISM:-true}" = "true" ]; then
 fi
 
 log "starting SQL Server as uid ${MSSQL_UID}"
-exec setpriv --reuid="$MSSQL_UID" --regid="$MSSQL_GID" --init-groups \
+exec $AFFINITY setpriv --reuid="$MSSQL_UID" --regid="$MSSQL_GID" --init-groups \
   /opt/mssql/bin/launch_sqlservr.sh "$@"
