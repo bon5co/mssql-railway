@@ -48,8 +48,13 @@ unset SA_PASSWORD
 #   Error: The system directory [/.system] could not be created ... Permission denied
 mkdir -p "$DATA_ROOT/data" "$DATA_ROOT/log" "$DATA_ROOT/backup" "$DATA_ROOT/secrets"
 owner_before="$(stat -c '%u:%g' "$DATA_ROOT")"
-chown -R "${MSSQL_UID}:${MSSQL_GID}" "$DATA_ROOT"
+if [ "${MSSQL_RUN_AS_ROOT:-false}" = "true" ]; then
+  chown -R 0:0 "$DATA_ROOT"
+else
+  chown -R "${MSSQL_UID}:${MSSQL_GID}" "$DATA_ROOT"
+fi
 chmod 0770 "$DATA_ROOT"
+log "ulimits: stack=$(ulimit -s) nofile=$(ulimit -n) memlock=$(ulimit -l)"
 log "volume ${DATA_ROOT} owner ${owner_before} -> $(stat -c '%u:%g' "$DATA_ROOT")"
 
 # --- 3. Memory and CPU ceilings ---------------------------------------------
