@@ -111,6 +111,32 @@ if [ "$cpu_quota" -gt 0 ] && [ "$online_cpus" -gt "$cpu_quota" ] && command -v t
   log "pinning to CPUs 0-$((cpu_quota - 1)) (${online_cpus} online, quota ${cpu_quota})"
 fi
 
+# --- 3b. Write-through IO for the volume filesystem ---------------------------
+# Railway mounts volumes as a bind mount whose filesystem does not honour the
+# forced-unit-access (FUA) writes SQL Server issues by default: the engine logs
+# "There have been 256 misaligned log IOs which required falling back to
+# synchronous IO" while starting up master and then dies with
+# "Message: Stack Overflow ... Last errno: 22 (Invalid argument)" before it ever
+# listens, on a deploy Railway still reports as SUCCESS. Microsoft's documented
+# setting for filesystems without proper direct-IO support is writethrough plus
+# alternatewritethrough, with trace flag 3979 to disable the FUA path.
+if [ "${MSSQL_FORCE_WRITETHROUGH:-true}" = "true" ]; then
+  conf="${MSSQL_ROOT:-/var/opt/mssql}/mssql.conf"
+  if ! grep -q "alternatewritethrough" "$conf" 2>/dev/null; then
+    {
+      echo "[control]"
+      echo "writethrough = 1"
+      echo "alternatewritethrough = 1"
+      echo ""
+      echo "[traceflag]"
+      echo "traceflag0 = 3979"
+    } >> "$conf"
+    log "wrote write-through IO settings to ${conf}"
+  else
+    log "write-through IO settings already present in ${conf}"
+  fi
+fi
+
 # --- 4. Parallelism sized from the cgroup ------------------------------------
 # SQL Server 2022 already reads the cgroup memory limit, but it counts logical
 # processors from the HOST (measured: "5 logical processors" inside a 2-CPU
