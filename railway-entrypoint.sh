@@ -115,6 +115,11 @@ if [ "${MSSQL_TUNE_PARALLELISM:-true}" = "true" ]; then
   /usr/local/bin/tune.sh &
 fi
 
+if [ "${MSSQL_RUN_AS_ROOT:-false}" = "true" ]; then
+  log "starting SQL Server as root (MSSQL_RUN_AS_ROOT=true)"
+  exec $AFFINITY /opt/mssql/bin/launch_sqlservr.sh "$@"
+fi
+
 log "starting SQL Server as uid ${MSSQL_UID}"
 exec $AFFINITY setpriv --reuid="$MSSQL_UID" --regid="$MSSQL_GID" --init-groups \
   /opt/mssql/bin/launch_sqlservr.sh "$@"
