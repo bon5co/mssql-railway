@@ -1,21 +1,33 @@
 # Microsoft SQL Server 2022 for Railway.
 #
-# Three Railway-specific problems are fixed here. Each one is shipped unfixed by
-# at least one live marketplace listing, and three of the five listings in this
-# category never finish their first boot because of them:
+# The problem this image exists to fix is where the volume goes. Every listing in
+# this category mounts it on /var/opt/mssql, which is the path the Docker Hub
+# README gives — and on Railway a volume there kills the engine before it ever
+# listens, on a deploy Railway still reports as SUCCESS:
 #
-#   1. Railway mounts volumes owned by uid 0, and this image runs as `mssql`
-#      (uid 10001). A volume on /var/opt/mssql is therefore unwritable by the
-#      process that has to write it, and the server exits immediately with
-#      "The system directory [/.system] could not be created ... Access Denied".
-#      The entrypoint repairs ownership as root and then drops back to uid 10001,
-#      so the database does not run as root either.
-#   2. SQL Server refuses to initialise on a password that fails its complexity
-#      policy, and it does so *after* the deploy looks like it started. The
-#      entrypoint validates the password itself and says exactly what is wrong.
-#   3. `2022-latest` moves. SQL Server upgrades its system databases when a newer
-#      engine attaches them and there is no supported downgrade, so an unpinned
-#      tag turns an unrelated redeploy into a one-way upgrade. Pinned by digest.
+#     Starting up database 'master'.
+#     There have been 256 misaligned log IOs which required falling back to
+#     synchronous IO.  The current IO is on file /var/opt/mssql/data/master.mdf.
+#     This program has encountered a fatal error and cannot continue running
+#             Reason: 0x00000006        Message: Stack Overflow
+#             Last errno: 22 (Invalid argument)
+#
+# The instance-wide state SQL Server keeps under /var/opt/mssql (the .system
+# hive, the secrets directory) cannot live on Railway's volume filesystem; the
+# database files themselves can. So the volume is mounted on /data and the data,
+# log and backup directories are pointed at it, which keeps master, msdb and
+# every user database — logins, SA password, schemas, rows — across redeploys.
+#
+# Also fixed here:
+#   * SQL Server refuses to initialise on a password that fails its complexity
+#     policy, and it does so *after* the deploy looks like it started. The
+#     entrypoint validates the password itself and says exactly what is wrong.
+#   * The container sees the HOST's CPU count and RAM (measured on Railway: 48
+#     processors, 393438 MB), so both the memory ceiling and MAXDOP are sized
+#     from /sys/fs/cgroup instead.
+#   * `2022-latest` moves. SQL Server upgrades its system databases when a newer
+#     engine attaches them and there is no supported downgrade, so an unpinned
+#     tag turns an unrelated redeploy into a one-way upgrade. Pinned by digest.
 FROM mcr.microsoft.com/mssql/server@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89
 
 USER root
@@ -31,9 +43,9 @@ ENV ACCEPT_EULA="Y" \
     MSSQL_PID="Developer" \
     MSSQL_AGENT_ENABLED="true" \
     MSSQL_TCP_PORT="1433" \
-    MSSQL_DATA_DIR="/var/opt/mssql/data" \
-    MSSQL_LOG_DIR="/var/opt/mssql/log" \
-    MSSQL_BACKUP_DIR="/var/opt/mssql/backup"
+    MSSQL_DATA_DIR="/data" \
+    MSSQL_LOG_DIR="/data" \
+    MSSQL_BACKUP_DIR="/data"
 
 EXPOSE 1433
 

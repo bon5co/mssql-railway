@@ -8,7 +8,7 @@ set -euo pipefail
 
 MSSQL_UID=10001
 MSSQL_GID=0
-DATA_ROOT="${MSSQL_DATA_ROOT:-/var/opt/mssql}"
+DATA_ROOT="${MSSQL_DATA_ROOT:-/data}"
 
 log() { echo "[railway] $*"; }
 
@@ -46,7 +46,7 @@ unset SA_PASSWORD
 # volume on the data directory is unwritable by the only process that needs it.
 # Unrepaired, sqlservr exits 1 with:
 #   Error: The system directory [/.system] could not be created ... Permission denied
-mkdir -p "$DATA_ROOT/data" "$DATA_ROOT/log" "$DATA_ROOT/backup" "$DATA_ROOT/secrets"
+mkdir -p "$DATA_ROOT"
 owner_before="$(stat -c '%u:%g' "$DATA_ROOT")"
 if [ "${MSSQL_RUN_AS_ROOT:-true}" = "true" ]; then
   chown -R 0:0 "$DATA_ROOT"
