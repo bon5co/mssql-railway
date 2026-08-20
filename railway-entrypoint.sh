@@ -130,6 +130,7 @@ if [ "${MSSQL_FORCE_WRITETHROUGH:-true}" = "true" ]; then
       echo ""
       echo "[traceflag]"
       echo "traceflag0 = 3979"
+      echo "traceflag1 = 1800"
     } >> "$conf"
     log "wrote write-through IO settings to ${conf}"
   else
