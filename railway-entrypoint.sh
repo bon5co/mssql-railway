@@ -1,157 +1,207 @@
 #!/bin/bash
-# Railway entrypoint for Microsoft SQL Server.
+# Railway entrypoint for SQL Server.
 #
-# Runs as root, repairs the volume, validates the SA password, then drops back to
-# the image's own `mssql` user (uid 10001) before starting the engine. The engine
-# itself never runs as root.
-set -euo pipefail
+# Boot sequence:
+#   1. repair the uid-0 volume mount and size the engine from the cgroup
+#   2. start the engine on a private port (14330) that Railway does not route
+#   3. restore every backup found on the volume, then replay persisted logins
+#   4. shut that instance down and re-exec the engine on 1433, so the first
+#      connection the deploy ever accepts is against restored state
+#   5. back up on a timer and once more on SIGTERM
+set -uo pipefail
+
+log() { echo "[railway] $*"; }
+die() { echo "[railway] FATAL: $*" >&2; exit 1; }
 
 MSSQL_UID=10001
 MSSQL_GID=0
-DATA_ROOT="${MSSQL_DATA_ROOT:-/data}"
+PRIVATE_PORT=14330
+DATA_DIR=/var/opt/mssql
+SQLCMD=/opt/mssql-tools18/bin/sqlcmd
 
-log() { echo "[railway] $*"; }
+[ -n "${MSSQL_SA_PASSWORD:-}" ] || die "MSSQL_SA_PASSWORD is empty. SQL Server has no other way in; refusing to boot."
 
-# --- 1. Password gate --------------------------------------------------------
-# SQL Server applies Windows password policy to the SA account and refuses to
-# initialise without a compliant one. It does that AFTER the container looks like
-# it started, so an unusable password reads as a mystery crash loop. Check it
-# here and say what is wrong.
-pw="${MSSQL_SA_PASSWORD:-${SA_PASSWORD:-}}"
-if [ -z "$pw" ]; then
-  log "FATAL: MSSQL_SA_PASSWORD is empty. Set it to a password of at least 8 characters"
-  log "       containing three of: uppercase, lowercase, digits, symbols."
-  exit 1
+BACKUP_DIR=${MSSQL_BACKUP_DIR:-/data/backups}
+STATE_DIR=${MSSQL_STATE_DIR:-/data/state}
+INTERVAL_MIN=${MSSQL_BACKUP_INTERVAL_MINUTES:-15}
+case "$INTERVAL_MIN" in ''|*[!0-9]*) INTERVAL_MIN=15 ;; esac
+[ "$INTERVAL_MIN" -ge 1 ] 2>/dev/null || INTERVAL_MIN=15
+
+# ---------------------------------------------------------------- volume repair
+# Railway mounts volumes owned by uid 0 while this image runs as uid 10001.
+for d in "$BACKUP_DIR" "$STATE_DIR"; do
+    mkdir -p "$d" || die "cannot create $d"
+done
+MOUNT_ROOT=$(dirname "$BACKUP_DIR")
+OWNER=$(stat -c %u:%g "$MOUNT_ROOT" 2>/dev/null || echo "?")
+log "volume $MOUNT_ROOT owned by $OWNER"
+if [ "$OWNER" != "${MSSQL_UID}:${MSSQL_GID}" ]; then
+    chown -R "${MSSQL_UID}:${MSSQL_GID}" "$MOUNT_ROOT" 2>/dev/null \
+        && log "repaired ownership of $MOUNT_ROOT to ${MSSQL_UID}:${MSSQL_GID}"
 fi
-if [ "${#pw}" -lt 8 ]; then
-  log "FATAL: MSSQL_SA_PASSWORD is ${#pw} characters; SQL Server requires at least 8."
-  exit 1
-fi
-classes=0
-[[ "$pw" =~ [A-Z] ]] && classes=$((classes + 1))
-[[ "$pw" =~ [a-z] ]] && classes=$((classes + 1))
-[[ "$pw" =~ [0-9] ]] && classes=$((classes + 1))
-[[ "$pw" =~ [^A-Za-z0-9] ]] && classes=$((classes + 1))
-if [ "$classes" -lt 3 ]; then
-  log "FATAL: MSSQL_SA_PASSWORD uses only ${classes} character classes; SQL Server requires"
-  log "       three of: uppercase, lowercase, digits, symbols. The server would exit 255 with"
-  log "       'Password validation failed' after the deploy appeared to start."
-  exit 1
-fi
-export MSSQL_SA_PASSWORD="$pw"
-unset SA_PASSWORD
+chown -R "${MSSQL_UID}:${MSSQL_GID}" "$DATA_DIR" 2>/dev/null || true
 
-# --- 2. Volume ownership -----------------------------------------------------
-# Railway mounts volumes owned by uid 0 and this image runs as uid 10001, so a
-# volume on the data directory is unwritable by the only process that needs it.
-# Unrepaired, sqlservr exits 1 with:
-#   Error: The system directory [/.system] could not be created ... Permission denied
-mkdir -p "$DATA_ROOT"
-owner_before="$(stat -c '%u:%g' "$DATA_ROOT")"
-if [ "${MSSQL_RUN_AS_ROOT:-true}" = "true" ]; then
-  chown -R 0:0 "$DATA_ROOT"
-else
-  chown -R "${MSSQL_UID}:${MSSQL_GID}" "$DATA_ROOT"
-fi
-chmod 0770 "$DATA_ROOT"
-log "ulimits: stack=$(ulimit -s) nofile=$(ulimit -n) memlock=$(ulimit -l)"
-log "volume ${DATA_ROOT} owner ${owner_before} -> $(stat -c '%u:%g' "$DATA_ROOT")"
+# ------------------------------------------------------------- cgroup sizing
+CPU_QUOTA=$(awk '{ if ($1 == "max") print 0; else printf "%d", ($1 / $2) + 0.5 }' /sys/fs/cgroup/cpu.max 2>/dev/null || echo 0)
+[ "${CPU_QUOTA:-0}" -gt 0 ] 2>/dev/null || CPU_QUOTA=$(nproc)
+MEM_MAX=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+if [ "$MEM_MAX" = "max" ]; then MEM_MB=0; else MEM_MB=$((MEM_MAX / 1024 / 1024)); fi
+ENGINE_MB=$((MEM_MB * 70 / 100))
+log "cpu_quota=${CPU_QUOTA} container_mem=${MEM_MB}MB (host reports $(nproc) cpus)"
 
-# --- 3. Memory and CPU ceilings ---------------------------------------------
-# SQL Server sizes itself from what the kernel reports, and on Railway that is
-# the HOST: a container with a 8 GB limit logged "Processors: 48, Total Memory:
-# 412550619136 bytes" and then died during startup of master with
-# "Reason: 0x00000006 Message: Stack Overflow" before it ever listened. Docker's
-# own cgroup reporting hides this locally (there the engine reads the limit
-# correctly), so it only appears on the platform. Read the cgroup ourselves and
-# hand the engine a memory ceiling and a CPU affinity mask it can actually honour.
-cgroup_mem_bytes() {
-  if [ -r /sys/fs/cgroup/memory.max ]; then
-    v="$(cat /sys/fs/cgroup/memory.max)"
-  elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
-    v="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"
-  else
-    v="max"
-  fi
-  case "$v" in ''|max|0) echo 0 ;; *) echo "$v" ;; esac
-}
-cgroup_cpus() {
-  if [ -r /sys/fs/cgroup/cpu.max ]; then
-    read -r q p_ < /sys/fs/cgroup/cpu.max || true
-    if [ "${q:-max}" != "max" ] && [ "${p_:-0}" -gt 0 ]; then
-      echo $(( (q + p_ - 1) / p_ )); return
-    fi
-  elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
-    q="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
-    p_="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
-    if [ "$q" -gt 0 ] && [ "$p_" -gt 0 ]; then echo $(( (q + p_ - 1) / p_ )); return; fi
-  fi
-  echo 0
-}
-
-host_mem_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo)"
-mem_bytes="$(cgroup_mem_bytes)"
-cpu_quota="$(cgroup_cpus)"
-online_cpus="$(nproc --all 2>/dev/null || echo 1)"
-log "cgroup memory.max=${mem_bytes} host MemTotal=$((host_mem_kb / 1024))MB cpu quota=${cpu_quota} online=${online_cpus}"
-
-if [ -z "${MSSQL_MEMORY_LIMIT_MB:-}" ] && [ "$mem_bytes" -gt 0 ]; then
-  mem_mb=$((mem_bytes / 1024 / 1024))
-  # SQL Server's own guidance is to leave headroom for the OS and for the
-  # non-buffer-pool allocations it makes outside this ceiling.
-  limit_mb=$((mem_mb * 70 / 100))
-  [ "$limit_mb" -lt 2048 ] && limit_mb=2048
-  export MSSQL_MEMORY_LIMIT_MB="$limit_mb"
-  log "MSSQL_MEMORY_LIMIT_MB=${limit_mb} (container limit ${mem_mb}MB)"
-fi
-
-AFFINITY=""
-if [ "$cpu_quota" -gt 0 ] && [ "$online_cpus" -gt "$cpu_quota" ] && command -v taskset >/dev/null 2>&1; then
-  AFFINITY="taskset -c 0-$((cpu_quota - 1))"
-  log "pinning to CPUs 0-$((cpu_quota - 1)) (${online_cpus} online, quota ${cpu_quota})"
-fi
-
-# --- 3b. Write-through IO for the volume filesystem ---------------------------
-# Railway mounts volumes as a bind mount whose filesystem does not honour the
-# forced-unit-access (FUA) writes SQL Server issues by default: the engine logs
-# "There have been 256 misaligned log IOs which required falling back to
-# synchronous IO" while starting up master and then dies with
-# "Message: Stack Overflow ... Last errno: 22 (Invalid argument)" before it ever
-# listens, on a deploy Railway still reports as SUCCESS. Microsoft's documented
-# setting for filesystems without proper direct-IO support is writethrough plus
-# alternatewritethrough, with trace flag 3979 to disable the FUA path.
-if [ "${MSSQL_FORCE_WRITETHROUGH:-true}" = "true" ]; then
-  conf="${MSSQL_ROOT:-/var/opt/mssql}/mssql.conf"
-  if ! grep -q "alternatewritethrough" "$conf" 2>/dev/null; then
+write_conf() {
+    # $1 = tcp port
     {
-      echo "[control]"
-      echo "writethrough = 1"
-      echo "alternatewritethrough = 1"
-      echo ""
-      echo "[traceflag]"
-      echo "traceflag0 = 3979"
-      echo "traceflag1 = 1800"
-    } >> "$conf"
-    log "wrote write-through IO settings to ${conf}"
-  else
-    log "write-through IO settings already present in ${conf}"
-  fi
+        echo "[network]"
+        echo "tcpport = $1"
+        # SQL Server rejects a memory limit below its 2 GB floor, so only pin it
+        # when the container is large enough for the clamp to be meaningful.
+        if [ "$ENGINE_MB" -ge 2048 ]; then
+            echo
+            echo "[memory]"
+            echo "memorylimitmb = ${ENGINE_MB}"
+        fi
+    } > "$DATA_DIR/mssql.conf"
+    chown "${MSSQL_UID}:${MSSQL_GID}" "$DATA_DIR/mssql.conf"
+}
+
+# SQL Server sizes its scheduler count from the CPUs it can SEE, which in a container
+# is the host's count, not the cgroup quota.
+CPU_LIST="0-$((CPU_QUOTA - 1))"
+[ "$CPU_QUOTA" -eq 1 ] && CPU_LIST="0"
+run_engine() { # background; $@ ignored
+    setpriv --reuid="$MSSQL_UID" --regid="$MSSQL_GID" --clear-groups \
+        taskset -c "$CPU_LIST" /opt/mssql/bin/sqlservr &
+    ENGINE_PID=$!
+}
+
+q() { # port, sql -> stdout, trimmed columns
+    local port=$1; shift
+    "$SQLCMD" -S "127.0.0.1,${port}" -U sa -P "$MSSQL_SA_PASSWORD" -C -b -h -1 -W -Q "$*"
+}
+
+# sqlcmd rejects -y alongside either -W or -h -1 ("The y and the W options are mutually
+# exclusive", "The -h and the -y 0 options are mutually exclusive"), and without -y it
+# truncates variable-length output at 256 characters - which silently corrupts a dumped
+# login SID or password hash. Long values therefore go through this variant, which keeps
+# -h -1 by asking for an explicit width rather than the unlimited -y 0, and strips the
+# padding -W would have removed afterwards.
+qlong() { # port, sql -> stdout, untruncated
+    local port=$1; shift
+    "$SQLCMD" -S "127.0.0.1,${port}" -U sa -P "$MSSQL_SA_PASSWORD" -C -b -h -1 -y 8000 -Q "$*" | sed -e "s/[[:space:]]*$//"
+}
+
+wait_ready() {
+    local port=$1 i
+    for i in $(seq 1 90); do
+        if q "$port" "SELECT 1" >/dev/null 2>&1; then return 0; fi
+        kill -0 "$ENGINE_PID" 2>/dev/null || return 1
+        sleep 2
+    done
+    return 1
+}
+
+# ------------------------------------------------------------------- restore
+restore_all() {
+    local port=$1 f db restored=0
+    shopt -s nullglob
+    for f in "$BACKUP_DIR"/*.bak; do
+        db=$(basename "$f" .bak)
+        if q "$port" "RESTORE DATABASE [${db}] FROM DISK = N'${f}' WITH REPLACE, RECOVERY" >/dev/null 2>&1; then
+            log "restored database [${db}] from $(basename "$f")"
+            restored=$((restored + 1))
+        else
+            log "WARNING: restore of [${db}] from $(basename "$f") failed"
+        fi
+    done
+    shopt -u nullglob
+    log "restore pass complete (${restored} database(s))"
+
+    if [ -s "$STATE_DIR/logins.sql" ]; then
+        if "$SQLCMD" -S "127.0.0.1,${port}" -U sa -P "$MSSQL_SA_PASSWORD" -C -b \
+             -i "$STATE_DIR/logins.sql" >/dev/null 2>&1; then
+            log "replayed persisted logins"
+        else
+            log "WARNING: replaying persisted logins failed"
+        fi
+    fi
+}
+
+# -------------------------------------------------------------------- backup
+dump_logins() {
+    local port=$1
+    # Server logins live in master, which is on the image layer. Re-emit them with
+    # their original SID and password hash so restored database users still map.
+    qlong "$port" "SET NOCOUNT ON;
+SELECT 'IF SUSER_SID(''' + REPLACE(p.name, '''', '''''') + ''') IS NULL CREATE LOGIN [' + p.name + '] WITH PASSWORD = ' + CONVERT(varchar(max), l.password_hash, 1) + ' HASHED, SID = ' + CONVERT(varchar(max), p.sid, 1) + ', CHECK_POLICY = OFF;'
+FROM sys.server_principals p
+JOIN sys.sql_logins l ON l.principal_id = p.principal_id
+WHERE p.type = 'S' AND p.name NOT LIKE '##%' AND p.name <> 'sa';" \
+        > "$STATE_DIR/logins.sql.tmp" 2>/dev/null \
+        && mv "$STATE_DIR/logins.sql.tmp" "$STATE_DIR/logins.sql" \
+        || log "WARNING: could not persist server logins"
+    rm -f "$STATE_DIR/logins.sql.tmp"
+}
+
+backup_all() {
+    local port=$1 db n=0
+    for db in $(q "$port" "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0 AND is_read_only = 0;" 2>/dev/null); do
+        [ -n "$db" ] || continue
+        case "$db" in *[!A-Za-z0-9_.-]*) log "skipping backup of [$db]: unsupported characters in name"; continue ;; esac
+        BAK="BACKUP DATABASE [${db}] TO DISK = N'${BACKUP_DIR}/${db}.bak' WITH INIT, FORMAT, COPY_ONLY"
+
+        # Backup compression is not available in every edition; fall back without it.
+
+        if q "$port" "$BAK, COMPRESSION" >/dev/null 2>&1 || q "$port" "$BAK" >/dev/null 2>&1; then
+            n=$((n + 1))
+        else
+            log "WARNING: backup of [${db}] failed"
+        fi
+    done
+    dump_logins "$port"
+    log "backup pass complete (${n} database(s) to ${BACKUP_DIR})"
+}
+
+# ================================================================= phase 1
+log "phase 1: recovering state on private port ${PRIVATE_PORT}"
+write_conf "$PRIVATE_PORT"
+run_engine
+if wait_ready "$PRIVATE_PORT"; then
+    restore_all "$PRIVATE_PORT"
+    q "$PRIVATE_PORT" "SHUTDOWN WITH NOWAIT" >/dev/null 2>&1
+    wait "$ENGINE_PID" 2>/dev/null
+    log "phase 1 complete"
+else
+    log "WARNING: engine did not become ready on the private port; skipping restore"
+    kill "$ENGINE_PID" 2>/dev/null
+    wait "$ENGINE_PID" 2>/dev/null
 fi
 
-# --- 4. Parallelism sized from the cgroup ------------------------------------
-# SQL Server 2022 already reads the cgroup memory limit, but it counts logical
-# processors from the HOST (measured: "5 logical processors" inside a 2-CPU
-# container), so MAXDOP is left at a value the container cannot deliver. Applied
-# after the engine is up, in the background, because it is a T-SQL setting.
-if [ "${MSSQL_TUNE_PARALLELISM:-true}" = "true" ]; then
-  /usr/local/bin/tune.sh &
+# ================================================================= phase 2
+log "phase 2: serving on 1433 (backup every ${INTERVAL_MIN} min to ${BACKUP_DIR})"
+write_conf 1433
+run_engine
+
+shutdown() {
+    log "SIGTERM received; taking a final backup before shutdown"
+    backup_all 1433
+    kill -TERM "$ENGINE_PID" 2>/dev/null
+    wait "$ENGINE_PID" 2>/dev/null
+    exit 0
+}
+trap shutdown TERM INT
+
+if wait_ready 1433; then
+    log "engine ready"
+    backup_all 1433
+    (
+        while sleep $((INTERVAL_MIN * 60)); do
+            kill -0 "$ENGINE_PID" 2>/dev/null || exit 0
+            backup_all 1433
+        done
+    ) &
+else
+    die "engine did not become ready on 1433"
 fi
 
-if [ "${MSSQL_RUN_AS_ROOT:-true}" = "true" ]; then
-  log "starting SQL Server as root"
-  exec $AFFINITY /opt/mssql/bin/launch_sqlservr.sh "$@"
-fi
-
-log "starting SQL Server as uid ${MSSQL_UID}"
-exec $AFFINITY setpriv --reuid="$MSSQL_UID" --regid="$MSSQL_GID" --init-groups \
-  /opt/mssql/bin/launch_sqlservr.sh "$@"
+wait "$ENGINE_PID"
