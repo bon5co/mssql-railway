@@ -5,7 +5,7 @@
 # system databases crash the engine during master recovery when /var/opt/mssql is the
 # mount. Data files therefore stay on the image layer and durability comes from native
 # backups written to the volume and restored on boot.
-FROM mcr.microsoft.com/mssql/server:2022-latest@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89
+FROM mcr.microsoft.com/mssql/server:2022-latest@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
 
 USER root
 
