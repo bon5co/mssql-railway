@@ -24,5 +24,5 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ghcr.io/bon5co/mssql-railway:2022-CU26
+            ghcr.io/bon5co/mssql-railway:2022-16.0.4305.5
             ghcr.io/bon5co/mssql-railway:latest
